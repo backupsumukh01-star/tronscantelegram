@@ -2,7 +2,8 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const TronWeb = require('tronweb');
+const TronWebModule = require('tronweb');
+const TronWeb = TronWebModule.default || TronWebModule;
 const axios = require('axios');
 require('dotenv').config();
 
