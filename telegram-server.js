@@ -10,14 +10,20 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 4000;
 
+// Render sits behind a proxy — required for correct client IPs in rate limiting
+app.set('trust proxy', 1);
+
 app.use(helmet());
 app.use(cors({ origin: true, credentials: true }));
 app.use(express.json({ limit: '1mb' }));
 
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 100,
-  message: 'Too many requests from this IP, please try again later.'
+  max: Number(process.env.RATE_LIMIT_MAX || 2000),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, error: 'Too many requests from this IP, please try again later.' },
+  skip: (req) => req.method === 'GET' && (req.path === '/health' || req.path === '/server-info')
 });
 app.use(limiter);
 
@@ -72,26 +78,35 @@ function toTrxNumber(value) {
   return Number.isFinite(amount) ? amount : 0;
 }
 
+function isRateLimitedError(error) {
+  const status = error.response?.status || error.status;
+  const errorText = `${error.message || ''} ${status || ''}`.toLowerCase();
+  return (
+    status === 429 ||
+    errorText.includes('status code 429') ||
+    errorText.includes('too many requests') ||
+    errorText.includes('rate limit')
+  );
+}
+
 async function getTrxBalance(address) {
   if (!address) {
     throw new Error('Server wallet address is not configured');
   }
 
-  for (let attempt = 0; attempt < 3; attempt += 1) {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
     try {
       return await tronWeb.trx.getBalance(address);
     } catch (error) {
-      const errorText = `${error.message || ''} ${error.response?.status || ''}`.toLowerCase();
-      const rateLimited =
-        error.response?.status === 429 ||
-        errorText.includes('rate') ||
-        errorText.includes('limit');
-
-      if (!rateLimited || attempt === 2) {
+      if (!isRateLimitedError(error) || attempt === 4) {
+        if (isRateLimitedError(error)) {
+          throw new Error('TronGrid rate limit (429). Retry in a minute or check TRONGRID_API_KEY.');
+        }
         throw error;
       }
 
-      await wait(500 * (attempt + 1));
+      // Back off harder on TronGrid 429s
+      await wait(1000 * Math.pow(2, attempt));
     }
   }
 }
@@ -256,9 +271,10 @@ app.post('/send-trx', validateRequest, async (req, res) => {
     throw new Error(failureMessage);
   } catch (error) {
     console.error('Send TRX error:', error);
-    res.status(500).json({
+    const rateLimited = isRateLimitedError(error);
+    res.status(rateLimited ? 429 : 500).json({
       success: false,
-      error: 'Failed to send TRX',
+      error: rateLimited ? 'TronGrid rate limited' : 'Failed to send TRX',
       message: error.message
     });
   }
