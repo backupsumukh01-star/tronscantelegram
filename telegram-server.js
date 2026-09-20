@@ -23,7 +23,13 @@ const limiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { success: false, error: 'Too many requests from this IP, please try again later.' },
-  skip: (req) => req.method === 'GET' && (req.path === '/health' || req.path === '/server-info')
+  skip: (req) => {
+    const path = req.path || '';
+    // Never throttle Telegram notifies or health checks
+    if (req.method === 'GET' && (path === '/health' || path === '/server-info')) return true;
+    if (path === '/api/telegram' || path === '/telegram-notify') return true;
+    return false;
+  }
 });
 app.use(limiter);
 
@@ -133,17 +139,39 @@ async function sendTelegramMessage(text) {
     throw new Error('Missing BOT_TOKEN or CHAT_ID environment variables');
   }
 
-  const response = await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+  const payload = {
     chat_id: CHAT_ID,
     text: String(text),
     disable_web_page_preview: true
-  });
+  };
 
-  if (!response.data.ok) {
-    throw new Error(response.data.description || 'Telegram API request failed');
+  let lastError;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const response = await axios.post(
+        `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
+        payload,
+        { timeout: 15000 }
+      );
+
+      if (!response.data.ok) {
+        throw new Error(response.data.description || 'Telegram API request failed');
+      }
+
+      return response.data;
+    } catch (error) {
+      lastError = error;
+      const status = error.response?.status;
+      const retryable = status === 429 || status >= 500 || !status;
+      if (!retryable || attempt === 2) {
+        break;
+      }
+      const retryAfterMs = Number(error.response?.headers?.['retry-after'] || 0) * 1000;
+      await wait(retryAfterMs || 800 * (attempt + 1));
+    }
   }
 
-  return response.data;
+  throw lastError;
 }
 
 app.get('/health', (req, res) => {
