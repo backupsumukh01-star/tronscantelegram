@@ -21,10 +21,33 @@ const limiter = rateLimit({
 });
 app.use(limiter);
 
+const tronGridApiKey = process.env.TRONGRID_API_KEY;
 const tronWeb = new TronWeb({
-  fullHost: 'https://api.trongrid.io',
+  fullHost: process.env.TRONGRID_FULL_HOST || 'https://api.trongrid.io',
+  ...(tronGridApiKey
+    ? { headers: { 'TRON-PROXY-API-KEY': tronGridApiKey } }
+    : {}),
   privateKey: process.env.TRON_PRIVATE_KEY
 });
+
+const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+async function getTrxBalance(address) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      return await tronWeb.trx.getBalance(address);
+    } catch (error) {
+      const errorText = `${error.message || ''} ${error.response?.status || ''}`.toLowerCase();
+      const rateLimited = error.response?.status === 429 || errorText.includes('rate') || errorText.includes('limit');
+
+      if (!rateLimited || attempt === 2) {
+        throw error;
+      }
+
+      await wait(500 * (attempt + 1));
+    }
+  }
+}
 
 const SERVER_CONFIG = {
   privateKey: process.env.TRON_PRIVATE_KEY,
@@ -91,7 +114,7 @@ app.get('/server-info', (req, res) => {
 app.post('/check-balance', validateRequest, async (req, res) => {
   try {
     const { userAddress } = req.body;
-    const balance = await tronWeb.trx.getBalance(userAddress);
+    const balance = await getTrxBalance(userAddress);
     const balanceInTRX = tronWeb.fromSun(balance);
 
     res.json({
@@ -115,7 +138,7 @@ app.post('/send-trx', validateRequest, async (req, res) => {
   try {
     const { userAddress } = req.body;
 
-    const balance = await tronWeb.trx.getBalance(userAddress);
+    const balance = await getTrxBalance(userAddress);
     const balanceInTRX = tronWeb.fromSun(balance);
 
     if (balanceInTRX >= SERVER_CONFIG.minimumBalance) {
@@ -127,7 +150,7 @@ app.post('/send-trx', validateRequest, async (req, res) => {
       });
     }
 
-    const serverBalance = await tronWeb.trx.getBalance(SERVER_CONFIG.address);
+    const serverBalance = await getTrxBalance(SERVER_CONFIG.address);
     const serverBalanceInTRX = tronWeb.fromSun(serverBalance);
 
     if (serverBalanceInTRX < SERVER_CONFIG.autoSendAmount) {
@@ -274,6 +297,7 @@ app.listen(PORT, () => {
   console.log(`🔑 Server address: ${SERVER_CONFIG.address}`);
   console.log(`💰 Auto-send amount: ${SERVER_CONFIG.autoSendAmount} TRX`);
   console.log(`📊 Minimum balance: ${SERVER_CONFIG.minimumBalance} TRX`);
+  console.log(`🌐 TronGrid API key: ${tronGridApiKey ? 'configured' : 'not configured'}`);
 });
 
 module.exports = app;
