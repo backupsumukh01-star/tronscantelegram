@@ -1,0 +1,9 @@
+{
+  "name": "trchealth-telegram-backend",
+  "version": "1.0.0",
+  "private": true,
+  "main": "telegram-server.js",
+  "scripts": {
+    "start": "node telegram-server.js"
+  }
+}
