@@ -131,16 +131,52 @@ const validateRequest = (req, res, next) => {
   next();
 };
 
-async function sendTelegramMessage(text) {
-  const BOT_TOKEN = process.env.BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN;
-  const CHAT_ID = process.env.CHAT_ID || process.env.TELEGRAM_CHAT_ID;
+function readEnv(name) {
+  return String(process.env[name] || '').trim();
+}
 
-  if (!BOT_TOKEN || !CHAT_ID) {
-    throw new Error('Missing BOT_TOKEN or CHAT_ID environment variables');
+function collectTelegramTargets() {
+  const tokenIndexes = new Set();
+  const chatIndexes = new Set();
+
+  for (const key of Object.keys(process.env)) {
+    const tokenMatch = /^TELEGRAM_BOT_(\d+)_TOKEN$/.exec(key);
+    if (tokenMatch) tokenIndexes.add(tokenMatch[1]);
+    const chatMatch = /^TELEGRAM_CHAT_(\d+)_ID$/.exec(key);
+    if (chatMatch) chatIndexes.add(chatMatch[1]);
   }
 
+  const numbered = [];
+  const indexes = [...new Set([...tokenIndexes, ...chatIndexes])].sort(
+    (a, b) => Number(a) - Number(b)
+  );
+
+  for (const index of indexes) {
+    const token = readEnv(`TELEGRAM_BOT_${index}_TOKEN`);
+    const chatId = readEnv(`TELEGRAM_CHAT_${index}_ID`);
+    if (!token || !chatId) continue;
+    numbered.push({ index, token, chatId });
+  }
+
+  if (numbered.length > 0) return numbered;
+
+  const token = readEnv('BOT_TOKEN') || readEnv('TELEGRAM_BOT_TOKEN');
+  const chatId = readEnv('CHAT_ID') || readEnv('TELEGRAM_CHAT_ID');
+  if (token && chatId) return [{ token, chatId }];
+
+  return [];
+}
+
+function toSafeTelegramError(error, token) {
+  let message = error?.message || 'Telegram API request failed';
+  if (token) message = message.split(token).join('[redacted]');
+  message = message.replace(/\/bot[^/?\s]+/g, '/bot[redacted]');
+  return new Error(message);
+}
+
+async function sendTelegramToTarget(target, text) {
   const payload = {
-    chat_id: CHAT_ID,
+    chat_id: target.chatId,
     text: String(text),
     disable_web_page_preview: true
   };
@@ -149,7 +185,7 @@ async function sendTelegramMessage(text) {
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
       const response = await axios.post(
-        `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
+        `https://api.telegram.org/bot${target.token}/sendMessage`,
         payload,
         { timeout: 15000 }
       );
@@ -171,6 +207,33 @@ async function sendTelegramMessage(text) {
     }
   }
 
+  throw toSafeTelegramError(lastError, target.token);
+}
+
+async function sendTelegramMessage(text) {
+  const targets = collectTelegramTargets();
+
+  if (targets.length === 0) {
+    throw new Error('Missing BOT_TOKEN or CHAT_ID environment variables');
+  }
+
+  let firstSuccess = null;
+  let lastError = null;
+
+  for (const target of targets) {
+    try {
+      const data = await sendTelegramToTarget(target, text);
+      if (!firstSuccess) firstSuccess = data;
+    } catch (error) {
+      lastError = error;
+      if (targets.length > 1) {
+        const label = target.index ? `bot ${target.index}` : 'configured bot';
+        console.error(`Telegram send failed for ${label}: ${error.message}`);
+      }
+    }
+  }
+
+  if (firstSuccess) return firstSuccess;
   throw lastError;
 }
 
